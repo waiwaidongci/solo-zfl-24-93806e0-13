@@ -21,9 +21,10 @@ DATA_DIR=/tmp/x npm start  # 自定义数据目录（测试隔离用）
 
 **跨棚调运**（`POST /api/shipments`，仅管理员）
 - 必须选已建档鸽只、来源棚（须为鸽只当前所在棚）、不同的目标棚，附健康证明编号与检疫有效期（不得早于当天）。
-- 一只鸽同一时刻只能有一张进行中（待验收/冻结）的调运单；观察期鸽只禁止调运。
+- 一只鸽同一时刻只能有一张进行中（待验收/冻结）的调运单；观察期（含解除申请**待复核**期间，直到管理员作出结论）禁止调运。
 - 发起后鸽只置为「在途」，验收后落地目标棚；拒收退回来源棚；验收后可再退回（须填原因）。
 - 状态机：`pending → accepted → returned`；`pending → rejected`；疫病期间 `pending ⇄ frozen`。非法跳转一律 422。
+- 验收/拒收只对「仍在途且 `inTransitShipmentId` 指向本单」的鸽只生效；**旧已验收单在该鸽已有后续进行中调运单时禁止退回**（409），避免覆盖后续在途/落地状态。
 - 目标棚只能操作发给自己的单；每次流转带 `version` 乐观锁，过期版本返回 409。
 
 **疫病接触链**（`POST /api/disease-events`，仅管理员）
@@ -33,14 +34,17 @@ DATA_DIR=/tmp/x npm start  # 自定义数据目录（测试隔离用）
 
 **审计**：每次变化写入经办人、时间、动作与前后值（`GET /api/audit`，仅管理员；支持 `?entity=&entityId=` 过滤）。
 
-**一致性**：所有写操作经串行写锁执行；校验失败整体回滚不落盘；落盘采用「写临时文件 + rename 原子替换」，不存在半条记录。
+**一致性**：所有写操作经串行写锁执行；每次变更前对内存库做深拷贝快照，校验失败或落盘失败（返回 500 `write_failed`）都会把内存**回滚到操作前**，因此后续查询与重启都不会看到未成功保存的调运单或鸽只在途标记；落盘本身采用「写临时文件 + rename 原子替换」，磁盘上也不存在半条记录。
 
 ## 测试
 
 ```bash
 npm test                 # API 层：越权/非法跳转/过期证明/并发争抢/回滚/重启持久化（34 项）
+npm run test:consistency # 状态一致性：待复核禁发、旧单退回不覆盖后续在途、落盘失败内存回滚、并发交叉（19 项）
 node tests/browser.test.mjs   # Playwright 真实浏览器：发起→验收→追踪→冻结→解除（截图存 tests/screenshots）
 ```
+
+> 落盘失败用例通过 `ENABLE_FAULTS=1` 开启的测试接口 `POST /api/_fault/fail-next-write`（令下一次写盘失败一次）验证；该开关默认关闭，生产环境返回 404。
 
 > 极简环境运行浏览器测试若提示缺系统库，已在本机将 arm64 依赖解包到 `/tmp/pwlibs`，用
 > `LD_LIBRARY_PATH=/tmp/pwlibs/usr/lib/aarch64-linux-gnu:/tmp/pwlibs/lib/aarch64-linux-gnu node tests/browser.test.mjs`

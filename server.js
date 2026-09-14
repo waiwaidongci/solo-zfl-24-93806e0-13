@@ -49,6 +49,7 @@ const seed = {
 /* ------------------------------------------------------------------ */
 let cache = null;
 let writeChain = Promise.resolve();
+let failNextWrite = process.env.FAIL_NEXT_WRITE === "1"; // 测试注入：下一次落盘失败一次
 
 async function loadDb() {
   if (cache) return cache;
@@ -65,20 +66,34 @@ async function loadDb() {
 }
 
 async function persist(db) {
+  // 测试注入：failNextWrite 为真时，本次落盘失败一次（模拟磁盘故障），随后自动复位
+  if (failNextWrite) {
+    failNextWrite = false;
+    const err = new Error("simulated disk write failure");
+    err.code = "WRITE_FAILED";
+    throw err;
+  }
   const snapshot = JSON.stringify(db, null, 2);
   await writeFile(tmpPath, snapshot);   // 写临时文件
   await rename(tmpPath, dbPath);        // 同目录原子替换：失败不会留下半截主库
 }
 
-// 所有变更都经由 mutate 串行化：回调内对 db 做全部修改与校验，
-// 抛错则不写盘（无半条记录）；返回值原样回传给调用方。
+// 所有变更都经由 mutate 串行化：回调内对 db 做全部修改与校验。
+// 无论校验抛错还是落盘失败，内存 cache 都回滚到操作前快照——
+// 保证返回错误（含落盘失败 500）后，后续查询与重启都看不到未成功保存的数据。
 async function mutate(fn) {
   const run = writeChain.then(async () => {
     const db = await loadDb();
-    const result = await fn(db);      // 校验失败应 throw HttpError，persist 不会执行
-    db.version += 1;
-    await persist(db);
-    return result;
+    const snapshot = structuredClone(db);
+    try {
+      const result = await fn(db);      // 校验失败应 throw HttpError，persist 不会执行
+      db.version += 1;
+      await persist(db);
+      return result;
+    } catch (err) {
+      cache = snapshot;                 // 内存一并回到原状态
+      throw err;
+    }
   });
   // 让链条在本次任务结束后继续，但失败不污染后续请求
   writeChain = run.then(() => {}, () => {});
@@ -162,9 +177,9 @@ function createShipment(db, actor, input) {
   const pigeon = db.pigeons.find(p => p.ringNo === ringNo) || fail(404, "pigeon_not_found");
   // 同一只鸽只能有一张进行中的调运单（优先于棚属校验：在途单的鸽 loftId 已为空）
   if (activeShipmentOf(db, ringNo)) fail(409, "shipment_already_active", "该鸽已有进行中的调运单");
-  // 处于观察期的鸽只不得发起调运
-  if (db.observations.some(o => o.ringNo === ringNo && o.status === "observing"))
-    fail(423, "pigeon_under_observation", "该鸽处于疫病观察期，禁止调运");
+  // 观察期（含已申请解除、待复核）的鸽只不得发起调运，必须等复核结论
+  if (db.observations.some(o => o.ringNo === ringNo && ["observing", "release_requested"].includes(o.status)))
+    fail(423, "pigeon_under_observation", "该鸽处于疫病观察/解除待复核期，禁止调运");
   // 来源棚必须与鸽只当前所在棚一致，防止凭空调出
   if (pigeon.loftId !== from.id) fail(422, "pigeon_not_in_source", `该鸽当前不在${from.name}`);
 
@@ -209,6 +224,22 @@ function actOnShipment(db, actor, id, action, input = {}) {
   if (!legal.from.includes(s.status))
     fail(422, "illegal_transition", `当前状态「${SHIP_STATUS[s.status]}」不能执行该操作（${legal.from.join("/")} → ${legal.to}）`);
   if (legal.needReason && !reason) fail(400, "reason_required", "拒收/退回必须填写原因");
+
+  // 在途一致性：待验收/拒收只对「仍在途且指向本单」的鸽只成立，
+  // 防止旧单或脏状态覆盖鸽只当前归属
+  if (action === "accept" || action === "reject") {
+    if (!pigeon || pigeon.inTransitShipmentId !== s.id || pigeon.loftId !== null)
+      fail(422, "shipment_not_active", "该调运单已不处于有效在途状态，鸽只当前归属不受影响");
+  }
+  // 验收后退回：若已存在后续进行中的调运单，旧单退回一律拒绝（不能覆盖其在途状态）；
+  // 否则鸽只必须仍停留在本单目标棚
+  if (action === "return") {
+    const otherActive = db.shipments.find(x => x.id !== s.id && activeStatuses.has(x.status) && x.ringNo === s.ringNo);
+    if (otherActive)
+      fail(409, "newer_shipment_active", "该鸽已有后续进行中的调运单，旧单退回不能覆盖其在途状态");
+    if (!pigeon || pigeon.loftId !== s.toLoftId)
+      fail(422, "pigeon_left_loft", "鸽只已不在该单目标棚，不能按此单退回");
+  }
 
   const beforeS = { status: s.status, version: s.version };
   const beforePigeon = pigeon ? { loftId: pigeon.loftId, owner: pigeon.owner } : null;
@@ -410,7 +441,7 @@ async function handle(req, res) {
   }
   if (p === "/api/pigeons" && req.method === "GET") {
     const db = await loadDb();
-    const obs = new Set(db.observations.filter(o => o.status === "observing").map(o => o.ringNo));
+    const obs = new Set(db.observations.filter(o => ["observing", "release_requested"].includes(o.status)).map(o => o.ringNo));
     return sendJson(res, 200, db.pigeons.map(x => ({ ...x, underObservation: obs.has(x.ringNo) })));
   }
   if (p === "/api/shipments" && req.method === "GET") {
@@ -476,6 +507,13 @@ async function handle(req, res) {
     cache = JSON.parse(await readFile(dbPath, "utf8"));
     return sendJson(res, 200, { ok: true });
   }
+  if (p === "/api/_fault/fail-next-write" && req.method === "POST") {
+    // 仅测试环境（ENABLE_FAULTS=1）：令下一次落盘失败，用于验证内存回滚
+    if (process.env.ENABLE_FAULTS !== "1") return sendJson(res, 404, { error: "not_found" });
+    failNextWrite = true;
+    res.writeHead(204);
+    return res.end();
+  }
 
   sendJson(res, 404, { error: "not_found" });
 }
@@ -485,6 +523,7 @@ const server = http.createServer(async (req, res) => {
     await handle(req, res);
   } catch (error) {
     if (error instanceof HttpError) return sendJson(res, error.status, { error: error.code, detail: error.detail });
+    if (error?.code === "WRITE_FAILED") return sendJson(res, 500, { error: "write_failed", detail: error.message });
     sendJson(res, 500, { error: "internal_error", detail: error.message });
   }
 });

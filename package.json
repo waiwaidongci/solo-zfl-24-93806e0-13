@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "node tests/api.test.mjs",
+    "test:consistency": "node tests/consistency.test.mjs",
     "test:browser": "node tests/browser.test.mjs"
   },
   "devDependencies": {
