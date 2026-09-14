@@ -1,12 +1,28 @@
 {
+  "version": 0,
+  "lofts": [
+    {
+      "id": "breed",
+      "name": "育种棚"
+    },
+    {
+      "id": "north",
+      "name": "北岸棚"
+    },
+    {
+      "id": "south",
+      "name": "南湾棚"
+    }
+  ],
   "pigeons": [
     {
       "ringNo": "CHN-2026-001",
       "owner": "北岸棚",
+      "loftId": "north",
       "fatherRing": "CHN-2022-188",
       "motherRing": "CHN-2023-512",
       "color": "灰",
-      "loft": "北岸A棚",
+      "batch": "B2026-04",
       "vaccines": [
         {
           "date": "2026-04-01",
@@ -33,10 +49,11 @@
     {
       "ringNo": "CHN-2022-188",
       "owner": "育种棚",
+      "loftId": "breed",
       "fatherRing": "",
       "motherRing": "",
       "color": "雨点",
-      "loft": "种鸽棚",
+      "batch": "B2022-01",
       "vaccines": [],
       "transfers": [],
       "races": []
@@ -44,13 +61,42 @@
     {
       "ringNo": "CHN-2023-512",
       "owner": "育种棚",
+      "loftId": "breed",
       "fatherRing": "",
       "motherRing": "",
       "color": "红轮",
-      "loft": "种鸽棚",
+      "batch": "B2023-02",
+      "vaccines": [],
+      "transfers": [],
+      "races": []
+    },
+    {
+      "ringNo": "CHN-2026-007",
+      "owner": "北岸棚",
+      "loftId": "north",
+      "fatherRing": "CHN-2022-188",
+      "motherRing": "",
+      "color": "雨点",
+      "batch": "B2026-04",
+      "vaccines": [],
+      "transfers": [],
+      "races": []
+    },
+    {
+      "ringNo": "CHN-2026-008",
+      "owner": "北岸棚",
+      "loftId": "north",
+      "fatherRing": "",
+      "motherRing": "CHN-2023-512",
+      "color": "灰白条",
+      "batch": "B2026-05",
       "vaccines": [],
       "transfers": [],
       "races": []
     }
-  ]
+  ],
+  "shipments": [],
+  "diseaseEvents": [],
+  "observations": [],
+  "audit": []
 }

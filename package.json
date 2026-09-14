@@ -1,9 +1,14 @@
 {
   "name": "zfl-24-racing-pigeon-registry",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node tests/api.test.mjs",
+    "test:browser": "node tests/browser.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
   }
 }
