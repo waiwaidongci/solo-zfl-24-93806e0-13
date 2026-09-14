@@ -134,6 +134,15 @@ function audit(db, actor, entity, entityId, action, before, after, extra = {}) {
 }
 const SHIP_STATUS = { pending: "待验收", accepted: "已验收", rejected: "已拒收", returned: "已退回", frozen: "已冻结" };
 const activeStatuses = new Set(["pending", "frozen"]);
+// 观察期：观察中 或 已申请解除待复核——在管理员作出复核结论前，鸽只归属冻结
+function observationOf(db, ringNo) {
+  return db.observations.find(o => o.ringNo === ringNo && ["observing", "release_requested"].includes(o.status));
+}
+function assertNotObserved(db, ringNo) {
+  const o = observationOf(db, ringNo);
+  if (o) fail(423, "pigeon_under_observation",
+    o.status === "release_requested" ? "该鸽解除观察尚待管理员复核，禁止调运流转" : "该鸽处于疫病观察期，禁止调运流转");
+}
 function activeShipmentOf(db, ringNo, exceptId) {
   return db.shipments.find(s => s.ringNo === ringNo && activeStatuses.has(s.status) && s.id !== exceptId);
 }
@@ -175,11 +184,10 @@ function createShipment(db, actor, input) {
   const to = db.lofts.find(l => l.id === toLoftId) || fail(404, "loft_not_found", "目标棚不存在");
   if (from.id === to.id) fail(422, "same_loft", "来源棚与目标棚不能相同");
   const pigeon = db.pigeons.find(p => p.ringNo === ringNo) || fail(404, "pigeon_not_found");
+  // 观察期（含已申请解除、待复核）优先拦截：归属冻结，必须等复核结论
+  assertNotObserved(db, ringNo);
   // 同一只鸽只能有一张进行中的调运单（优先于棚属校验：在途单的鸽 loftId 已为空）
   if (activeShipmentOf(db, ringNo)) fail(409, "shipment_already_active", "该鸽已有进行中的调运单");
-  // 观察期（含已申请解除、待复核）的鸽只不得发起调运，必须等复核结论
-  if (db.observations.some(o => o.ringNo === ringNo && ["observing", "release_requested"].includes(o.status)))
-    fail(423, "pigeon_under_observation", "该鸽处于疫病观察/解除待复核期，禁止调运");
   // 来源棚必须与鸽只当前所在棚一致，防止凭空调出
   if (pigeon.loftId !== from.id) fail(422, "pigeon_not_in_source", `该鸽当前不在${from.name}`);
 
@@ -224,6 +232,11 @@ function actOnShipment(db, actor, id, action, input = {}) {
   if (!legal.from.includes(s.status))
     fail(422, "illegal_transition", `当前状态「${SHIP_STATUS[s.status]}」不能执行该操作（${legal.from.join("/")} → ${legal.to}）`);
   if (legal.needReason && !reason) fail(400, "reason_required", "拒收/退回必须填写原因");
+
+  // 观察期（观察中 / 解除待复核）：验收、拒收、退回一律拒绝。
+  // 注：在途单在确诊时已被冻结，其验收/拒收在上一步先得到 422；此处主要拦截
+  // 「已验收单在观察期被退回」等会改变鸽只归属的操作。失败即整体回滚，单据与鸽只均不变。
+  assertNotObserved(db, s.ringNo);
 
   // 在途一致性：待验收/拒收只对「仍在途且指向本单」的鸽只成立，
   // 防止旧单或脏状态覆盖鸽只当前归属
@@ -384,9 +397,10 @@ function reviewRelease(db, actor, id, input = {}) {
   o.reviewComment = comment;
   audit(db, actor, "observation", o.id, approve ? "release_approved" : "release_rejected", before, { status: o.status, reviewComment: comment }, { ringNo: o.ringNo });
 
-  // 解除观察且该鸽没有其它观察记录时：若其存在因疫病冻结的调运单，按事件解除冻结回到待验收（仍需目标棚自行验收）
+  // 复核通过且该鸽没有任何仍在观察/待复核的记录时：若存在因疫病冻结的调运单，解除冻结回到待验收
+  // （仍需目标棚自行验收）；只要还有一条观察未结论，单据保持冻结
   if (approve) {
-    const stillObserving = db.observations.some(x => x.ringNo === o.ringNo && x.status === "observing");
+    const stillObserving = db.observations.some(x => x.ringNo === o.ringNo && ["observing", "release_requested"].includes(x.status));
     if (!stillObserving) {
       for (const sh of db.shipments) {
         if (sh.status === "frozen" && sh.ringNo === o.ringNo) {
@@ -679,12 +693,14 @@ function renderShipments() {
   box.innerHTML = state.shipments.slice().reverse().map(s => {
     const canHandle = me.role === "loft" && me.loftId === s.toLoftId;
     const frozen = s.status === "frozen";
+    const observed = !!pigeon(s.ringNo)?.underObservation; // 观察中/待复核：归属冻结
     let actions = "";
-    if (canHandle && s.status === "pending")
-      actions = '<div class="row"><button class="green" data-act="accept" data-id="'+s.id+'" data-ver="'+s.version+'">验收</button><button class="red" data-act="reject" data-id="'+s.id+'" data-ver="'+s.version+'">拒收</button></div><input data-reason="'+s.id+'" placeholder="拒收原因（必填）">';
-    if (canHandle && s.status === "accepted")
-      actions = '<input data-reason="'+s.id+'" placeholder="退回原因（必填）"><div class="row" style="margin-top:6px"><button class="amber" data-act="return" data-id="'+s.id+'" data-ver="'+s.version+'">退回来源棚</button></div>';
     if (frozen) actions = '<div class="meta tagobs">⛔ 已因疫病冻结，禁止验收流转</div>';
+    else if (observed) actions = '<div class="meta tagobs">⛔ 该鸽处于疫病观察/解除待复核期，验收·拒收·退回均已锁定（待管理员复核解除）</div>';
+    else if (canHandle && s.status === "pending")
+      actions = '<div class="row"><button class="green" data-act="accept" data-id="'+s.id+'" data-ver="'+s.version+'">验收</button><button class="red" data-act="reject" data-id="'+s.id+'" data-ver="'+s.version+'">拒收</button></div><input data-reason="'+s.id+'" placeholder="拒收原因（必填）">';
+    else if (canHandle && s.status === "accepted")
+      actions = '<input data-reason="'+s.id+'" placeholder="退回原因（必填）"><div class="row" style="margin-top:6px"><button class="amber" data-act="return" data-id="'+s.id+'" data-ver="'+s.version+'">退回来源棚</button></div>';
     return '<div class="ship '+s.status+'"><div class="row" style="justify-content:space-between"><b>'+esc(s.ringNo)+'</b><span class="pill '+s.status+'">'+
       {pending:"待验收",accepted:"已验收",rejected:"已拒收",returned:"已退回",frozen:"已冻结"}[s.status]+'</span></div>'+
       '<div class="meta">'+esc(s.fromName)+' → '+esc(s.toName)+' ｜ 证明 '+esc(s.healthCertNo)+' ｜ 检疫有效期至 '+esc(s.quarantineUntil)+' ｜ 版本 v'+s.version+'</div>'+

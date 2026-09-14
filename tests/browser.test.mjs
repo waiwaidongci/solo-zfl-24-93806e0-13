@@ -134,6 +134,10 @@ try {
   await page.waitForTimeout(300);
   const frozenSouth = page.locator(".ship", { hasText: "CHN-2026-008" }).first();
   await expect("冻结状态下南湾棚无验收按钮", await frozenSouth.locator('[data-act="accept"]').count() === 0);
+  // 007 的已验收单（同批次被观察）在南湾棚视角下不得出现退回按钮——观察期归属冻结
+  const obsAccepted = page.locator("#tab-ship .ship", { hasText: "CHN-2026-007" }).first();
+  await expect("观察中已验收单无退回按钮，显示观察期锁定",
+    (await obsAccepted.locator('[data-act="return"]').count()) === 0 && (await obsAccepted.textContent()).includes("观察"));
   await page.screenshot({ path: `${SHOTS}/4-疫病冻结.png`, fullPage: true });
 
   console.log("5) 解除观察需申请+管理员复核，复核后解冻并可验收");
